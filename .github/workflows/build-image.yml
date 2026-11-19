@@ -1,0 +1,74 @@
+name: Build Docker Image
+
+on:
+  # 仅手动触发（Actions 页面 → Run workflow）。
+  # 不随 push/PR 自动运行：每次构建要打包约 250MB 的镜像 tar 作为产物，
+  # 私有仓库的 artifact 存储额度有限。
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: rsi-submission
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag
+        id: meta
+        run: echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # 境外 runner 用官方 PyPI：Dockerfile 默认的清华源会超时。
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha }}
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+            PIP_TRUSTED_HOST=
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 冒烟检查：镜像能起来、协议自检正常、LightGBM 能导入。
+      # 镜像里是 ENTRYPOINT [] + CMD ["python3","/app/harness.py","describe"]，
+      # 直接 `docker run image describe` 会把 describe 当成可执行文件而失败，
+      # 必须显式给出 --entrypoint。
+      - name: Smoke test
+        run: |
+          IMG="${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha }}"
+
+          echo "--- describe ---"
+          docker run --rm --entrypoint python3 "$IMG" /app/harness.py describe
+
+          echo "--- libgomp / lightgbm ---"
+          docker run --rm --entrypoint sh "$IMG" -c \
+            'ls /usr/lib/x86_64-linux-gnu/libgomp.so.1 && python3 -c "import lightgbm, numpy, sklearn; print(\"lightgbm\", lightgbm.__version__)"'
+
+          echo "--- 运行身份与 /app 可读 ---"
+          docker run --rm --entrypoint sh "$IMG" -c \
+            'id -u && test -r /app/harness.py && echo "/app readable"'
+
+      # 镜像约 570MB，压缩后约 250MB。导出耗时几分钟，故只在手动触发时执行。
+      - name: Export image
+        run: |
+          docker save "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha }}" \
+            | gzip -1 > image.tar.gz
+          ls -lh image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IMAGE_NAME }}-${{ steps.meta.outputs.sha }}
+          path: image.tar.gz
+          retention-days: 30
